@@ -102,7 +102,7 @@ Don't want to use ROS? **Build the entire thing in your own 3D rendering environ
 
 ```
 docker-Hackathon/
-├── Dockerfile                              # Builds the ROS 2 + Gazebo Docker image
+├── Dockerfile                              # Builds the ROS 2 Docker image
 ├── docker-compose.yml                      # Starts the container
 ├── DockerSetup.md                          # Setup guide (Docker, WSL, etc.)
 ├── ProblemStatement.md                     # ← You are here
