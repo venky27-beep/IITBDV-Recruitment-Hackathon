@@ -177,10 +177,25 @@ class Solution(Bot):
         gm = local_to_global(measurements, self.pos, self.heading)
         self._global_meas = gm
 
-        D           = distance.cdist(gm, current_map)
+        '''D           = distance.cdist(gm, current_map)
         self._assoc = np.argmin(D, axis=1)
-        return self._assoc
+        return self._assoc'''
+        R_inv = np.eye(2)/(NOISE_STD**2) # this is the measurement covariance matrix giving the measurement s a weight wrt to their accuracy
+        diff = gm[:,None,:] - current_map[None,:,:]#this is the difference between the measurements and the  cones that weve mapped already
+        mah2 = np.einsum("mnd,de,mne->mn",diff,R_inv,diff) # this is the mahalanobi distance which is kinda like a weighted distance which takes into account the sensor noise as well
 
+        cost = np.where(mah2 < 5.991,mah2,1e9) # this is the cost matrix and were saying that if the mahalanobi dist is more than 5.991 (95% of the sensor readings are lesser than 5.991) then it is too far away for the measurement to be a cone and hence the cost is set to 10^9
+        from scipy.optimize import linear_sum_assignment
+        row_ind,col_ind = linear_sum_assignment(cost) # this is the hungarian algorithm this looks at the whole cost matrix and finds a unique pairing of measurements which makes the total cost minimum
+        assoc = np.full(len(gm) , -1 , dtype = int) # this is the association array which is initialized to -1 meaning that no measurement is associated with any cone
+        big_cost = 1e9
+        for r,c in zip(row_ind,col_ind):
+            if cost[r,c] < big_cost : 
+                assoc[r] = c # this means that if the cost is less than 10^9 then we can say that this measurement is associated with this cone
+        self._assoc = assoc
+        return self._assoc
+    
+        
 # ── Problem 1 – Data Association ──────────────────────────────────────────────
 def make_problem1():
     """
@@ -215,6 +230,16 @@ def make_problem1():
         setup_ax(ax, f"Frame {frame+1}/{N_FRAMES}  –  "
                      "green lines = NN association")
         ax.legend(loc="upper right", fontsize=8, framealpha=0.8)
+        # for each matched measurement, measure how far it ended up from its assigned cone
+        if len(sol._global_meas) > 0 and len(sol._assoc) > 0:
+            matched = sol._assoc >= 0
+            if matched.any():
+                errors = [
+                    np.linalg.norm(sol._global_meas[i] - MAP_CONES[sol._assoc[i]])
+                    for i in range(len(sol._assoc))
+                    if sol._assoc[i] >= 0
+                ]
+                print(f"frame {frame:3d}  mean assignment error: {np.mean(errors):.3f} m")
         fig.tight_layout(rect=[0, 0, 1, 0.95])
 
     ani = FuncAnimation(fig, update, frames=N_FRAMES, interval=100, repeat=True)

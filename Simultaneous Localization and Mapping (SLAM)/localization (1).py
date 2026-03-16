@@ -95,18 +95,6 @@ def get_measurements(pos: np.ndarray, heading: float) -> np.ndarray:
     return local + np.random.normal(0, NOISE_STD, local.shape)
 
 
-def step_kinematic(pos: np.ndarray, heading: float,
-                   velocity: float, steering: float):
-    """One bicycle-model step; returns (new_pos, new_heading)."""
-    new_pos = pos.copy()
-    new_pos[0] += velocity * np.cos(heading) * DT
-    new_pos[1] += velocity * np.sin(heading) * DT
-    new_heading = angle_wrap(
-        heading + (velocity / WHEELBASE) * np.tan(steering) * DT
-    )
-    return new_pos, new_heading
-
-
 def draw_track(ax, alpha_b: float = 0.4, alpha_y: float = 0.4) -> None:
     ax.scatter(BLUE_CONES[:, 0],   BLUE_CONES[:, 1],
                c="royalblue", marker="^", s=65,  alpha=alpha_b,
@@ -159,140 +147,155 @@ class Solution(Bot):
         # Internal state exposed for visualisation
         self._global_meas = np.zeros((0, 2))
         self._assoc       = np.array([], dtype=int)
-        self._lm_mu   = []   # estimated position of each cone (2,_) array
-        self._lm_P    = []   # uncertainty of each cone, 2x2 matrix
-        self._lm_n    = []   # how many times we've seen each cone
-        self._lm_miss = []   # how many frames since we last saw each cone
+        self._mu = np.array([self.pos[0], self.pos[1], self.heading])  # (x, y, ψ) state estimate
+        self._Sigma = np.diag([0.01,0.01, np.radians(1.0)])**2  # initial uncertainty covariance matrix
+
 
     # ------------------------------------------------------------------
-    def mapping(self, measurements):
+    def localization(self, velocity, steering):
+        """
+        Bicycle kinematic model (dead reckoning):
+            ẋ = v·cos(ψ)
+            ẏ = v·sin(ψ)
+            ψ̇ = (v / L)·tan(δ)
+        """
+        px,py,psi = self._mu
+        self._mu[0]  += velocity * np.cos(psi) * DT
+        self._mu[1]  += velocity * np.sin(psi) * DT
+        self._mu[2] += (velocity / WHEELBASE) * np.tan(steering) *DT
+        '''self.pos[0]  += velocity * np.cos(self.heading) * DT
+        self.pos[1]  += velocity * np.sin(self.heading) * DT
+        self.heading  = angle_wrap(
+            self.heading + (velocity / WHEELBASE) * np.tan(steering) * DT
+        )'''
+        F = np.array([[1,0, -velocity * np.sin(psi) * DT,],[0,1, velocity * np.cos(psi) * DT],[0,0,1]])# this is the jacobian matrix of the motion of the car wrt to its current state del(xt+1)/del(xt)
+        var_x = 0.05**2
+        var_y = 0.05**2
+        var_yaw = np.radians(0.50)**2
 
-    
-        INIT_DIST  = 1.5   # metres — how far a measurement must be from all existing landmarks before we consider it a new cone
-        ASSOC_DIST = 2.5   # metres — max distance to match a measurement to an existing landmark
-        MIN_OBS    = 3     # how many times we must see a cone before we trust it
-        MAX_MISS   = 15    # frames without a sighting before we delete a tentative cone
-        SIGMA_INIT = 1.0   # initial uncertainty (metres) for a brand new cone
-        R = (NOISE_STD ** 2) * np.eye(2)   # sensor noise covariance
-        if len(measurements) == 0:
-            for k in range(len(self._lm_n)):
-                if self._lm_n[k] < MIN_OBS:# if we haven't seen this cone enough times to be sure it's real
-                    self._lm_mss[k] += 1# age landmarks we didn't see this frame
-            self._prune(MIN_OBS, MAX_MISS)# delete landmarks that are tentative and haven't been seen in a while
-            return
+        # Create a 1D array of the diagonal elements
+        diagonal_elements = np.array([var_x, var_y, var_yaw])
 
-        # convert measurements from local sensor frame to global coordinates
-        gm = local_to_global(measurements, self.pos, self.heading)
+        # Use np.diag() with the 1D array to create the 2D diagonal matrix
+        Q = np.diag(diagonal_elements)
+        self._Sigma = F @ self._Sigma @ F.T + Q #this is the covaraince update step of the EKF and we add the noise 
+        self._Sigma = (self._Sigma + self._Sigma.T)*0.5#this makes it symmetric for easier calculations
 
-        # track which landmarks got updated this frame
-        observed = set()
+        R = (NOISE_STD**2) * np.eye(2) # this is the measurement noise covariance matri     x which models the uncertainty in the measurements
+        meas = get_measurements(self._mu[0:2], self._mu[2]) # this is the measurement we get from the environment in the local frame of the car
+        gm = local_to_global(meas, self._mu[0:2], self._mu[2]) # this converts the measurements to the global frame of reference
+        D = distance.cdist(gm,MAP_CONES) # this calculates the distance between the measurements and the map cones
+        for i, row in enumerate(D):
+            j = np.argmin(row) # this finds the index of the closest cone in the map for each measurement
+            dist = row[j] # this is the distance to the closest cone
+            if dist > 3:
+                continue # if the distance is too large we ignore this measurement
+            px2,py2,psi2 = self._mu
+            c,s = np.cos(psi2), np.sin(psi2)
+            z_l = np.array([[c,s],[-s,c]]) @ (MAP_CONES[j] - self._mu[0:2]) # this is the expected measurement in the local frame of the car for the closest cone
+            dz = np.array([[-s,-c],[-c,s]]) @z_l #this is the derivative of z_l wrt psi
+            H = np.array([[1,0,dz[0]],[0,1,dz[1]]]) # this is the jacobian matrix of the measurement model
+            z_hat = np.array([[c, -s], [s, c]]) @ z_l + self._mu[:2]# this is the expected measurement in the global frame of reference
+            nu    = gm[i] - z_hat#this is the difference b/w actual measumetemnt and expected measuerement
+            S = H @ self._Sigma @ H.T + R# this is the innovation covariance matrix
+            if float(nu @ np.linalg.solve(S, nu)) > 5.991:#if this is true then measurement is with outlier for 95% confidence hence its probably a wrong value
+                continue
+            K = self._Sigma @ H.T @ np.linalg.inv(S)# this tells me hoe much i should trust the measurement wrt to my estimate
 
-        for z in gm:
+            self._mu    = self._mu + K @ nu#this will update the state
+            self._mu[2] = angle_wrap(self._mu[2])
+            IKH         = np.eye(3) - K @ H# this will update the covariance matrix 
+            self._Sigma = IKH @ self._Sigma @ IKH.T + K @ R @ K.T 
+            self._Sigma = (self._Sigma + self._Sigma.T) * 0.5
+        self.pos     = self._mu[:2].copy() # this will update the position of the car to the estimated position
+        self.heading = float(self._mu[2])# this will update the heading of the car to the estimated heading
+        
 
-            # ── find the best matching existing landmark ──────────────────
-            best_idx  = -1
-            best_mah2 = 5.991 # 95% confidence threshold for 2 DOF (chi-squared distribution)
-            for k in range(len(self._lm_mu)):
-                if np.linalg.norm(z - self._lm_mu[k]) > ASSOC_DIST:#we check the distance between the measurement and the landmark, if it's greater than the association distance we skip it
-                    continue
 
-                # Mahalanobis distance accounts for the cone's current uncertainty
-                # a cone we've seen many times has small P so its gate is tight
-                # a new cone has large P so its gate is loose
-                S    = self._lm_P[k] + R
-                nu   = z - self._lm_mu[k]
-                mah2 = float(nu @ np.linalg.solve(S, nu))
 
-                if mah2 < best_mah2:
-                    best_mah2 = mah2
-                    best_idx  = k
-
-            if best_idx >= 0:
-                #update existing landmark with Kalman filter 
-                # K decides how much this new measurement should move our estimate
-                # if we've seen this cone 50 times, K is tiny — we barely move
-                # if this is only the 2nd sighting, K is large — we move a lot
-                P_k = self._lm_P[best_idx]
-                S   = P_k + R
-                K   = P_k @ np.linalg.inv(S)
-
-                self._lm_mu[best_idx]   = self._lm_mu[best_idx] + K @ (z - self._lm_mu[best_idx])
-                self._lm_P[best_idx]    = (np.eye(2) - K) @ P_k
-                self._lm_n[best_idx]   += 1
-                self._lm_miss[best_idx] = 0
-                observed.add(best_idx)
-
-            else:
-                # no match found — maybe this is a new cone 
-                # only add it if it's far enough from everything we already know
-                if not self._lm_mu or \
-                min(np.linalg.norm(z - m) for m in self._lm_mu) > INIT_DIST:
-                    self._lm_mu.append(z.copy())
-                    self._lm_P.append((SIGMA_INIT ** 2) * np.eye(2))
-                    self._lm_n.append(1)
-                    self._lm_miss.append(0)
-
-        # age landmarks we didn't see this frame
-        for k in range(len(self._lm_n)):
-            if self._lm_n[k] < MIN_OBS and k not in observed:
-                self._lm_miss[k] += 1
-
-        # delete landmarks that are tentative and haven't been seen in a while
-        self._prune(MIN_OBS, MAX_MISS)
-
-        # update learned_map with only confirmed landmarks
-        # this is what the rest of the scaffolding reads from
-        self.learned_map = []
-        for mu, n in zip(self._lm_mu, self._lm_n):
-                if n >= MIN_OBS:
-                    self.learned_map.append(mu.copy())
-
-    def _prune(self, min_obs, max_miss):
-        # keep landmarks that are either confirmed or haven't been missed for too long
-        keep = [k for k in range(len(self._lm_n))
-                if self._lm_n[k] >= min_obs or self._lm_miss[k] <= max_miss]
-        self._lm_mu   = [self._lm_mu[k]   for k in keep]
-        self._lm_P    = [self._lm_P[k]    for k in keep]
-        self._lm_n    = [self._lm_n[k]    for k in keep]
-        self._lm_miss = [self._lm_miss[k] for k in keep]
-    
-def make_problem3():
+# ── Problem 2 – Localization ───────────────────────────────────────────────────
+def make_problem2():
     """
-    Visualise incremental mapping: green × marks show the car's accumulated
-    global cone map built from local sensor measurements.  Ground-truth cones
-    are faded so the learned map stands out.
+    Visualise dead-reckoning: the magenta trail is the car's estimated
+    trajectory built purely from the kinematic model and steering commands.
     """
-    sol = Solution()
+    sol     = Solution()
+    path_x  = [float(sol.pos[0])]
+    path_y  = [float(sol.pos[1])]
     fig, ax = plt.subplots(figsize=(10, 7))
-    fig.suptitle("Problem 3 – Mapping  (Local → Global Transform + Deduplication)",
+    fig.suptitle("Problem 2 – Localization  (Dead Reckoning / Kinematic Model)",
                  fontsize=13, fontweight="bold")
 
     def update(frame):
         ax.clear()
         steer = pure_pursuit(sol.pos, sol.heading, CENTERLINE)
-        meas  = get_measurements(sol.pos, sol.heading)
-        sol.pos, sol.heading = step_kinematic(sol.pos, sol.heading, SPEED, steer)
-        sol.mapping(meas)
+        sol.localization(SPEED, steer)
+        path_x.append(float(sol.pos[0]))
+        path_y.append(float(sol.pos[1]))
 
-        draw_track(ax, alpha_b=0.15, alpha_y=0.15)
-
-        if sol.learned_map:
-            lm = np.array(sol.learned_map)
-            ax.scatter(lm[:, 0], lm[:, 1],
-                       c="limegreen", marker="x", s=90, linewidths=2.0,
-                       zorder=5, label=f"Mapped cones ({len(lm)})")
-
+        draw_track(ax)
+        ax.plot(path_x, path_y, color="magenta", lw=2.0,
+                alpha=0.85, zorder=4, label="Dead-reckoning path")
         draw_car(ax, sol.pos, sol.heading)
         setup_ax(ax,
             f"Frame {frame+1}/{N_FRAMES}  –  "
-            f"map size: {len(sol.learned_map)} / {len(MAP_CONES)} cones")
+            f"pos=({sol.pos[0]:.1f}, {sol.pos[1]:.1f})  "
+            f"ψ={np.degrees(sol.heading):.1f}°")
         ax.legend(loc="upper right", fontsize=8, framealpha=0.8)
         fig.tight_layout(rect=[0, 0, 1, 0.95])
 
     ani = FuncAnimation(fig, update, frames=N_FRAMES, interval=100, repeat=True)
     return fig, ani
 
+ #── Localization Accuracy Test ────────────────────────────────────────────────
+def compare_baseline_vs_ekf(n_frames=130):
+    """
+    Runs both estimators side by side with artificial heading noise added
+    to simulate real IMU drift. Prints position error for each.
+    """
+    def step_kinematic(pos, heading, velocity, steering):
+        new_pos = pos.copy()
+        new_pos[0] += velocity * np.cos(heading) * DT
+        new_pos[1] += velocity * np.sin(heading) * DT
+        new_heading = angle_wrap(heading + (velocity / WHEELBASE) * np.tan(steering) * DT)
+        return new_pos, new_heading
+    np.random.seed(42)
+    HEADING_NOISE = np.radians(0.8)   # 0.8 degrees of drift per step
 
+    # --- ground truth: perfect physics, no noise ---
+    true_pos  = CAR_START_POS.copy()
+    true_head = CAR_START_HEADING
+
+    # --- baseline: dead reckoning with heading drift ---
+    dr_pos  = CAR_START_POS.copy()
+    dr_head = CAR_START_HEADING
+
+    # --- your EKF ---
+    ekf = Solution()
+
+    dr_errors  = []
+    ekf_errors = []
+
+    for _ in range(n_frames):
+        steer = pure_pursuit(true_pos, true_head, CENTERLINE)
+
+        # advance ground truth perfectly
+        true_pos, true_head = step_kinematic(true_pos, true_head, SPEED, steer)
+
+        # advance dead reckoning with a small random heading nudge each step
+        dr_pos, dr_head = step_kinematic(dr_pos, dr_head, SPEED, steer)
+        dr_head = angle_wrap(dr_head + np.random.normal(0, HEADING_NOISE))
+
+        # advance EKF (it corrects itself using cone observations)
+        ekf.localization(SPEED, steer)
+
+        dr_errors.append(np.linalg.norm(dr_pos - true_pos))
+        ekf_errors.append(np.linalg.norm(ekf.pos - true_pos))
+
+    print(f"dead reckoning — mean error: {np.mean(dr_errors):.3f} m   "
+          f"final error: {dr_errors[-1]:.3f} m")
+    print(f"EKF            — mean error: {np.mean(ekf_errors):.3f} m   "
+          f"final error: {ekf_errors[-1]:.3f} m")
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("=== Driverless Car Hackathon – SLAM Visualisation ===")
@@ -305,6 +308,6 @@ if __name__ == "__main__":
     print("\nOpening 1 animation window …")
 
     # Keep references to prevent garbage collection of FuncAnimation objects.
-    fig3, ani3 = make_problem3()
-
-    plt.show()  
+    fig2, ani2 = make_problem2()
+    compare_baseline_vs_ekf(n_frames=130)
+    plt.show()
